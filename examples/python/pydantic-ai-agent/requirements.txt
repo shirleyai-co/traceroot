@@ -1,0 +1,5 @@
+pydantic-ai>=0.0.14
+python-dotenv>=1.0.0
+
+traceroot==0.1.0
+openinference-instrumentation-pydantic-ai>=0.1.0
