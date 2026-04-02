@@ -3,8 +3,7 @@ OpenAI Agents SDK with TraceRoot observability.
 
 Usage:
     cp .env.example .env
-    pip install -r requirements.txt
-    python main.py
+    uv run --no-project --python 3.13 --with-requirements requirements.txt python main.py
 """
 
 import asyncio
@@ -17,17 +16,15 @@ if dotenv_path:
 else:
     print("No .env file found (find_dotenv returned None).\nUsing process environment variables.")
 
-# =============================================================================
-# TRACEROOT SETUP
-# =============================================================================
+# Initialize TraceRoot first — sets the global OTel TracerProvider
 import traceroot
-from openinference.instrumentation.openai_agents import OpenAIAgentsInstrumentor
-from opentelemetry.sdk.trace import TracerProvider
-
-provider = TracerProvider()
-OpenAIAgentsInstrumentor().instrument(tracer_provider=provider)
 
 traceroot.initialize()
+
+# Then instrument — uses the global provider set by TraceRoot
+from openinference.instrumentation.openai_agents import OpenAIAgentsInstrumentor
+
+OpenAIAgentsInstrumentor().instrument()
 
 # =============================================================================
 # AGENT
@@ -51,7 +48,7 @@ def calculate(expression: str) -> str:
     """Evaluate a math expression."""
     try:
         return str(eval(expression))
-    except:
+    except Exception:
         return "Error"
 
 
