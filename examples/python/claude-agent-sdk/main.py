@@ -24,6 +24,10 @@ from traceroot import observe
 
 traceroot.initialize()
 
+from openinference.instrumentation.claude_agent_sdk import ClaudeAgentSDKInstrumentor
+
+ClaudeAgentSDKInstrumentor().instrument()
+
 from claude_agent_sdk import query, ClaudeAgentOptions
 
 
