@@ -1,16 +1,16 @@
 """
 Gemini ReAct agent with tool use and TraceRoot observability.
 
+Uses the new google.genai SDK (not the deprecated google.generativeai).
+
 Usage:
     cp .env.example .env
-    pip install -r requirements.txt
-    python main.py
+    uv run --no-project --python 3.13 --with-requirements requirements.txt python main.py
 """
 
 import json
 import logging
 import os
-from datetime import datetime
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -20,14 +20,14 @@ if dotenv_path:
 else:
     print("No .env file found (find_dotenv returned None).\nUsing process environment variables.")
 
-import google.generativeai as genai
+from google import genai
 
 import traceroot
 from traceroot import observe, using_attributes
 
 traceroot.initialize()
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-@observe(name="get_weather", type="tool")
 def get_weather(city: str) -> dict:
     """Get current weather for a city."""
     weather_db = {
@@ -51,7 +50,6 @@ def get_weather(city: str) -> dict:
     return {"city": city, **data}
 
 
-@observe(name="get_stock_price", type="tool")
 def get_stock_price(symbol: str) -> dict:
     """Get stock price for a symbol."""
     stocks = {
@@ -64,7 +62,6 @@ def get_stock_price(symbol: str) -> dict:
     return {"symbol": symbol.upper(), **data}
 
 
-@observe(name="calculate", type="tool")
 def calculate(expression: str) -> dict:
     """Evaluate a math expression safely using AST parsing."""
     import ast
@@ -102,59 +99,6 @@ TOOLS = {
     "calculate": calculate,
 }
 
-# ---------------------------------------------------------------------------
-# Tool declarations for Gemini
-# ---------------------------------------------------------------------------
-
-get_weather_func = genai.protos.FunctionDeclaration(
-    name="get_weather",
-    description="Get current weather for a city",
-    parameters=genai.protos.Schema(
-        type=genai.protos.Type.OBJECT,
-        properties={
-            "city": genai.protos.Schema(
-                type=genai.protos.Type.STRING,
-                description="City name",
-            )
-        },
-        required=["city"],
-    ),
-)
-
-get_stock_price_func = genai.protos.FunctionDeclaration(
-    name="get_stock_price",
-    description="Get current stock price for a ticker symbol",
-    parameters=genai.protos.Schema(
-        type=genai.protos.Type.OBJECT,
-        properties={
-            "symbol": genai.protos.Schema(
-                type=genai.protos.Type.STRING,
-                description="Stock ticker symbol (e.g., AAPL)",
-            )
-        },
-        required=["symbol"],
-    ),
-)
-
-calculate_func = genai.protos.FunctionDeclaration(
-    name="calculate",
-    description="Evaluate a mathematical expression",
-    parameters=genai.protos.Schema(
-        type=genai.protos.Type.OBJECT,
-        properties={
-            "expression": genai.protos.Schema(
-                type=genai.protos.Type.STRING,
-                description="Math expression (e.g., '2 + 2 * 3')",
-            )
-        },
-        required=["expression"],
-    ),
-)
-
-GEMINI_TOOLS = genai.protos.Tool(
-    function_declarations=[get_weather_func, get_stock_price_func, calculate_func]
-)
-
 
 # ---------------------------------------------------------------------------
 # Agent
@@ -164,17 +108,58 @@ GEMINI_TOOLS = genai.protos.Tool(
 class ReActAgent:
     """ReAct-style agent using Google Gemini's function calling API."""
 
-    def __init__(self, model: str = "gemini-2.0-flash"):
-        self.model = genai.GenerativeModel(
-            model_name=model,
-            tools=[GEMINI_TOOLS],
-            system_instruction=(
-                "You are a helpful AI assistant with access to tools. "
-                "Use available tools to gather information, then provide "
-                "a clear, comprehensive answer."
-            ),
+    def __init__(self, model: str = "gemini-2.5-flash"):
+        self.model = model
+        self.contents: list = []
+        self.system_instruction = (
+            "You are a helpful AI assistant with access to tools. "
+            "Use available tools to gather information, then provide "
+            "a clear, comprehensive answer."
         )
-        self.chat = self.model.start_chat()
+        # Declare tools for Gemini
+        self.tools = [
+            genai.types.Tool(
+                function_declarations=[
+                    genai.types.FunctionDeclaration(
+                        name="get_weather",
+                        description="Get current weather for a city",
+                        parameters=genai.types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "city": genai.types.Schema(type="STRING", description="City name"),
+                            },
+                            required=["city"],
+                        ),
+                    ),
+                    genai.types.FunctionDeclaration(
+                        name="get_stock_price",
+                        description="Get current stock price for a ticker symbol",
+                        parameters=genai.types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "symbol": genai.types.Schema(
+                                    type="STRING", description="Stock ticker symbol (e.g., AAPL)"
+                                ),
+                            },
+                            required=["symbol"],
+                        ),
+                    ),
+                    genai.types.FunctionDeclaration(
+                        name="calculate",
+                        description="Evaluate a mathematical expression",
+                        parameters=genai.types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "expression": genai.types.Schema(
+                                    type="STRING", description="Math expression (e.g., '2 + 2 * 3')"
+                                ),
+                            },
+                            required=["expression"],
+                        ),
+                    ),
+                ]
+            )
+        ]
 
     @observe(name="execute_tool", type="span")
     def _execute_tool(self, name: str, arguments: dict) -> str:
@@ -187,26 +172,37 @@ class ReActAgent:
 
     @observe(name="agent_turn", type="agent")
     def run(self, query: str) -> str:
-        response = self.chat.send_message(query)
+        self.contents.append(genai.types.Content(role="user", parts=[genai.types.Part(text=query)]))
 
         for _ in range(5):
-            # Collect all function call parts from the response
+            response = client.models.generate_content(
+                model=self.model,
+                contents=self.contents,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=self.system_instruction,
+                    tools=self.tools,
+                ),
+            )
+
+            # Check for function calls
             function_calls = []
             for part in response.candidates[0].content.parts:
-                if part.function_call.name:
-                    function_calls.append(part.function_call)
+                if part.function_call:
+                    function_calls.append(part)
 
             if not function_calls:
-                # No tool calls — extract text and return
-                text_parts = []
-                for part in response.candidates[0].content.parts:
-                    if part.text:
-                        text_parts.append(part.text)
+                # No tool calls — extract text
+                text_parts = [p.text for p in response.candidates[0].content.parts if p.text]
+                self.contents.append(response.candidates[0].content)
                 return "\n".join(text_parts)
 
-            # Execute tools and build function response parts
+            # Add model response to history
+            self.contents.append(response.candidates[0].content)
+
+            # Execute tools and send results back
             tool_response_parts = []
-            for fc in function_calls:
+            for part in function_calls:
+                fc = part.function_call
                 name = fc.name
                 args = dict(fc.args)
                 logger.info(f"Tool call: {name}({args})")
@@ -215,15 +211,15 @@ class ReActAgent:
                 result_dict = json.loads(result_str)
 
                 tool_response_parts.append(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
+                    genai.types.Part(
+                        function_response=genai.types.FunctionResponse(
                             name=name,
-                            response={"result": result_dict},
+                            response=result_dict,
                         )
                     )
                 )
 
-            response = self.chat.send_message(tool_response_parts)
+            self.contents.append(genai.types.Content(role="user", parts=tool_response_parts))
 
         return "I wasn't able to complete this task within the allowed steps."
 
